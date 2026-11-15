@@ -1,0 +1,104 @@
+name: Debian packages
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
+      - run: go vet ./...
+
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Determine package version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo 'Release tags must look like v0.1.0' >&2
+              exit 1
+            fi
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.1.0~ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build Debian package
+        run: bash scripts/build-deb.sh '${{ steps.version.outputs.value }}' '${{ matrix.arch }}'
+      - name: Verify package metadata and contents
+        shell: bash
+        run: |
+          package="dist/cu-go_${{ steps.version.outputs.value }}_${{ matrix.arch }}.deb"
+          test "$(dpkg-deb --field "$package" Architecture)" = '${{ matrix.arch }}'
+          dpkg-deb --contents "$package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cu-go-deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: package
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cu-go-release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cu-go-deb-*
+          path: dist
+          merge-multiple: true
+      - name: Publish Debian packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            tag=development
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              gh release create "$tag" --target "$GITHUB_SHA" --title 'Development builds' --notes 'Latest packages built from main.' --prerelease
+            fi
+          else
+            tag="$GITHUB_REF_NAME"
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              gh release create "$tag" --target "$GITHUB_SHA" --generate-notes
+            fi
+          fi
+          gh release upload "$tag" dist/*.deb --clobber
+          if [[ "$tag" == development ]]; then
+            gh release edit "$tag" --target "$GITHUB_SHA"
+            while IFS= read -r asset; do
+              if [[ -n "$asset" && ! -f "dist/$asset" ]]; then
+                gh release delete-asset "$tag" "$asset" --yes
+              fi
+            done < <(gh release view "$tag" --json assets --jq '.assets[].name')
+          fi
